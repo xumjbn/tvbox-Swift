@@ -93,6 +93,44 @@ struct HomeView: View {
     
     // MARK: - 分类标签栏
     
+    private func categoryLabel(_ sort: MovieSort.SortData) -> some View {
+        let isSelected = viewModel.selectedSort?.id == sort.id
+        return VStack(spacing: 6) {
+            Text(sort.name)
+                .font(.system(size: 14, weight: isSelected ? .bold : .regular))
+                .foregroundColor(isSelected ? .white : .white.opacity(0.6))
+
+            // 底部指示条
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(Color.orange)
+                .frame(width: 20, height: 3)
+                .opacity(isSelected ? 1 : 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .contentShape(Rectangle())
+    }
+
+    #if os(macOS)
+    /// macOS：分类较多时自动换行，鼠标不便横向滚动。
+    private var categoryTabBar: some View {
+        FlowLayout(spacing: 0) {
+            ForEach(viewModel.sorts) { sort in
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        viewModel.selectSort(sort)
+                    }
+                } label: {
+                    categoryLabel(sort)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.bottom, 4)
+    }
+    #else
     private var categoryTabBar: some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
@@ -105,19 +143,7 @@ struct HomeView: View {
                             categoryScrollAnchorId = sort.id
                             scrollCategoryBar(to: sort.id, proxy: proxy)
                         } label: {
-                            VStack(spacing: 6) {
-                                Text(sort.name)
-                                    .font(.system(size: 14, weight: viewModel.selectedSort?.id == sort.id ? .bold : .regular))
-                                    .foregroundColor(viewModel.selectedSort?.id == sort.id ? .white : .white.opacity(0.6))
-                                
-                                // 底部指示条
-                                RoundedRectangle(cornerRadius: 1.5)
-                                    .fill(Color.orange)
-                                    .frame(width: 20, height: 3)
-                                    .opacity(viewModel.selectedSort?.id == sort.id ? 1 : 0)
-                            }
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
+                            categoryLabel(sort)
                         }
                         .buttonStyle(.plain)
                         .id(sort.id)
@@ -141,6 +167,7 @@ struct HomeView: View {
         }
         .padding(.bottom, 4)
     }
+    #endif
     
     private func categoryIndex(for id: String?) -> Int? {
         guard let id else { return nil }
@@ -216,31 +243,52 @@ struct HomeView: View {
 
     private func filterRow(_ filter: MovieSort.SortFilter, sort: MovieSort.SortData) -> some View {
         let selected = viewModel.selectedValue(for: filter, in: sort)
+        #if os(macOS)
+        // macOS：标题固定在左侧，选项超出宽度自动换行
+        return HStack(alignment: .firstTextBaseline, spacing: 10) {
+            filterTitle(filter)
+            FlowLayout(spacing: 6) {
+                filterChips(filter, selected: selected)
+            }
+        }
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        #else
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                Text(filter.name)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.45))
-                    .padding(.trailing, 4)
-
-                ForEach(filter.values, id: \.self) { value in
-                    let isSelected = value.v == selected
-                    Button {
-                        viewModel.selectFilter(filter, value: value.v)
-                    } label: {
-                        Text(value.n)
-                            .font(.system(size: 12, weight: isSelected ? .bold : .regular))
-                            .foregroundColor(isSelected ? .white : .white.opacity(0.65))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(
-                                Capsule().fill(isSelected ? Color.orange.opacity(0.85) : Color.white.opacity(0.06))
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
+                filterTitle(filter)
+                filterChips(filter, selected: selected)
             }
             .padding(.horizontal, 20)
+        }
+        #endif
+    }
+
+    private func filterTitle(_ filter: MovieSort.SortFilter) -> some View {
+        Text(filter.name)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundColor(.white.opacity(0.45))
+            .padding(.trailing, 4)
+            .padding(.vertical, 5)
+    }
+
+    @ViewBuilder
+    private func filterChips(_ filter: MovieSort.SortFilter, selected: String) -> some View {
+        ForEach(filter.values, id: \.self) { value in
+            let isSelected = value.v == selected
+            Button {
+                viewModel.selectFilter(filter, value: value.v)
+            } label: {
+                Text(value.n)
+                    .font(.system(size: 12, weight: isSelected ? .bold : .regular))
+                    .foregroundColor(isSelected ? .white : .white.opacity(0.65))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule().fill(isSelected ? Color.orange.opacity(0.85) : Color.white.opacity(0.06))
+                    )
+            }
+            .buttonStyle(.plain)
         }
     }
 

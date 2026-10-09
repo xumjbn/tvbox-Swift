@@ -9,6 +9,7 @@
 #                  --notarize <notarytool-keychain-profile>   # 正式签名 + 公证
 #
 # 产物: dist/TVBox-<版本>-<架构>.dmg（同时打印 sha256）
+# 环境变量: APP_VERSION 覆盖版本号，BUILD_NUMBER 覆盖构建号（不传则用工程里的值）
 # 依赖: 完整 Xcode（xcodebuild；仅装 Command Line Tools 不够），--app 模式只需系统自带 hdiutil。
 set -euo pipefail
 
@@ -104,6 +105,11 @@ build_app() {
         products_dir="$BUILD_DIR/Products/$CONFIGURATION"
     fi
 
+    # 可选覆盖版本号：APP_VERSION（如 1.0.5）、BUILD_NUMBER（如 CI 运行序号）
+    local version_args=()
+    [ -n "${APP_VERSION:-}" ] && version_args+=(MARKETING_VERSION="$APP_VERSION")
+    [ -n "${BUILD_NUMBER:-}" ] && version_args+=(CURRENT_PROJECT_VERSION="$BUILD_NUMBER")
+
     # 构建阶段不签名：工程配置了自动签名 + Team，CI/无开发者账号的机器上会直接失败；
     # 签名统一在 sign_app 里做（ad-hoc 或 --sign 指定的 Developer ID）。
     xcodebuild \
@@ -115,6 +121,7 @@ build_app() {
         CODE_SIGNING_ALLOWED=NO \
         CODE_SIGNING_REQUIRED=NO \
         CODE_SIGN_IDENTITY="" \
+        ${version_args[@]+"${version_args[@]}"} \
         build | { command -v xcpretty >/dev/null 2>&1 && xcpretty || cat; }
 
     APP_PATH="$products_dir/$APP_NAME.app"

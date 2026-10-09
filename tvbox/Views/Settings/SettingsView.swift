@@ -125,7 +125,7 @@ struct SettingsView: View {
                     
                     // 关于
                     SectionCard(title: "关于") {
-                        SettingsRow(icon: "info.circle", title: "版本", value: "1.0.0", action: nil)
+                        SettingsRow(icon: "info.circle", title: "版本", value: appVersionText, action: nil)
                         Divider().background(Color.white.opacity(0.1))
                         SettingsRow(icon: "globe", title: "站点数量", value: "\(apiConfig.sourceBeanList.count)", action: nil)
                         Divider().background(Color.white.opacity(0.1))
@@ -522,6 +522,14 @@ struct SectionCard<Content: View>: View {
             .glassCard(cornerRadius: 16)
         }
     }
+}
+
+/// 当前 App 版本，形如 "1.0.4 (12)"（版本号 + 构建号）。
+private var appVersionText: String {
+    let info = Bundle.main.infoDictionary
+    let version = info?["CFBundleShortVersionString"] as? String ?? "-"
+    let build = info?["CFBundleVersion"] as? String ?? ""
+    return build.isEmpty ? version : "\(version) (\(build))"
 }
 
 struct SettingsRow: View {
