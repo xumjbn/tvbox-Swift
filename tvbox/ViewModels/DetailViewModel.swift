@@ -76,7 +76,8 @@ class DetailViewModel: ObservableObject {
         errorMessage = nil
         
         do {
-            if let info = try await sourceService.getDetail(sourceBean: source, vodId: video.id) {
+            if var info = try await sourceService.getDetail(sourceBean: source, vodId: video.id) {
+                info.playFlag = Self.preferredFlag(in: info)
                 self.vodInfo = info
                 self.selectedFlag = info.playFlag
                 self.selectedEpisodeIndex = info.playIndex
@@ -239,7 +240,9 @@ class DetailViewModel: ObservableObject {
         qualityOptions.count > 1
     }
     
-    /// 设置播放地址：开启广告过滤且为 HLS 时先去广告，失败或未发现广告则用原地址。
+    /// 设置播放地址：
+    /// 1) 网页播放页（如 /share/xxx）先嗅探出真实的 m3u8/mp4 地址；
+    /// 2) 开启广告过滤且为 HLS 时去广告，失败或未发现广告则用原地址。
     /// 处理期间保持旧地址不变，避免全屏播放器因 playUrl 置空而被关闭。
     private func setPlaybackURL(_ url: String) {
         requestedPlayURL = url
@@ -247,7 +250,9 @@ class DetailViewModel: ObservableObject {
         let token = UUID()
         playbackPrepareToken = token
 
-        guard HLSAdFilter.isEnabled, let parsed = URL(string: url), Self.looksLikeHLSURL(parsed) else {
+        let needsSniff = MediaURLResolver.needsResolve(url)
+        let isHLS = URL(string: url).map(Self.looksLikeHLSURL) ?? false
+        guard needsSniff || (HLSAdFilter.isEnabled && isHLS) else {
             isPreparingPlayback = false
             playUrl = url
             return
@@ -255,16 +260,32 @@ class DetailViewModel: ObservableObject {
 
         isPreparingPlayback = true
         Task {
-            let prepared = await HLSAdFilter.prepare(url: url)
+            var target = url
+            if needsSniff, let sniffed = await MediaURLResolver.resolve(pageURL: url) {
+                target = sniffed
+            }
             guard token == playbackPrepareToken else { return }
-            isPreparingPlayback = false
-            if let prepared {
+
+            if HLSAdFilter.isEnabled, let parsed = URL(string: target), Self.looksLikeHLSURL(parsed),
+               let prepared = await HLSAdFilter.prepare(url: target) {
+                guard token == playbackPrepareToken else { return }
                 playUrl = prepared.localURL
                 adFilterNote = "已过滤 \(prepared.removedGroups) 段广告（约 \(Int(prepared.removedSeconds.rounded())) 秒）"
             } else {
-                playUrl = url
+                guard token == playbackPrepareToken else { return }
+                playUrl = target
             }
+            isPreparingPlayback = false
         }
+    }
+
+    /// 默认线路：优先选剧集地址是视频文件（m3u8/mp4 等）的线路，
+    /// 避免默认落到需要网页解析的线路（如非凡资源的 feifan 是 /share/ 播放页）。
+    private static func preferredFlag(in info: VodInfo) -> String {
+        info.playFlags.first { flag in
+            guard let first = info.playUrlMap[flag]?.first else { return false }
+            return MediaURLResolver.isDirectMedia(first.url)
+        } ?? info.playFlag
     }
 
     private func selectedPlayableURL(fallback: String) -> String {
@@ -534,8 +555,10 @@ class DetailViewModel: ObservableObject {
 /// m3u8 去广告（对应影视仓的"去广告"）。
 ///
 /// 资源站常在正片切片之间插入广告，并用 `#EXT-X-DISCONTINUITY` 隔开。
-/// 识别规则：按 DISCONTINUITY 切段，正片切片来自同一目录；
-/// 目录与正片不同、且总时长较短的段判定为广告并删除。识别结果可疑时宁可不删。
+/// 识别规则（按 DISCONTINUITY 切段）：
+/// 1. 目录与正片不同、且总时长较短的段；
+/// 2. 夹在两段长正片之间的短段（广告与正片同目录的站点）。
+/// 识别结果可疑（删除占比过高）时宁可不删。
 enum HLSAdFilter {
     /// 设置开关的持久化 key，默认开启。
     static let enabledKey = "ad_filter_enabled"
@@ -547,6 +570,10 @@ enum HLSAdFilter {
 
     /// 单段广告的最长时长（秒），超过视为正片的一部分。
     private static let maxAdGroupSeconds: Double = 120
+    /// 同目录插播广告：短段时长上限（秒）。
+    private static let maxSandwichedAdSeconds: Double = 45
+    /// 同目录插播广告：前后两段都至少这么长才算"夹在正片中间"（秒）。
+    private static let minContentNeighborSeconds: Double = 120
     /// 删除总时长占比上限，超过说明识别不可靠，放弃过滤。
     private static let maxRemovedRatio: Double = 0.3
 
@@ -657,15 +684,23 @@ enum HLSAdFilter {
         guard let mainDirectory = durationByDirectory.max(by: { $0.value < $1.value })?.key else { return nil }
 
         let totalSeconds = groups.joined().reduce(0) { $0 + $1.duration }
+        let groupDurations = groups.map { group in group.reduce(0) { $0 + $1.duration } }
         var kept: [[Segment]] = []
         var removedGroups = 0
         var removedSeconds: Double = 0
 
-        for group in groups {
-            let groupSeconds = group.reduce(0) { $0 + $1.duration }
+        for (index, group) in groups.enumerated() {
+            let groupSeconds = groupDurations[index]
             let mainCount = group.filter { $0.directory == mainDirectory }.count
-            // 整段都不在正片目录、且时长短 → 广告
-            if mainCount == 0 && groupSeconds <= maxAdGroupSeconds {
+            // 规则一：整段都不在正片目录、且时长短 → 广告
+            let isForeignShortGroup = mainCount == 0 && groupSeconds <= maxAdGroupSeconds
+            // 规则二：夹在两段长正片之间的短段 → 插播广告
+            // （如非凡资源：广告与正片同目录、同样的哈希文件名，只能靠"短段夹在长段中间"识别）
+            let isSandwichedShortGroup = index > 0 && index < groups.count - 1
+                && groupSeconds <= maxSandwichedAdSeconds
+                && groupDurations[index - 1] >= minContentNeighborSeconds
+                && groupDurations[index + 1] >= minContentNeighborSeconds
+            if isForeignShortGroup || isSandwichedShortGroup {
                 removedGroups += 1
                 removedSeconds += groupSeconds
             } else {
@@ -863,5 +898,82 @@ final class LocalPlaylistServer: @unchecked Sendable {
                 connection.cancel()
             })
         }
+    }
+}
+
+// MARK: - 网页播放页嗅探
+
+/// 部分线路给的是网页播放页（如 `https://xxx/share/<id>`）而非视频地址，
+/// 播放器直接打开会报 "Cannot Open"。这里读取网页，从中找出真实的 m3u8/mp4 地址。
+enum MediaURLResolver {
+    /// 可由播放器直接播放的扩展名。
+    private static let mediaExtensions: Set<String> = [
+        "m3u8", "m3u", "mp4", "m4v", "mov", "flv", "mkv", "avi", "ts", "webm", "mpd", "mp3", "aac"
+    ]
+    /// 读取网页的上限，播放页通常只有几 KB。
+    private static let maxPageBytes = 512 * 1024
+
+    /// 地址是否像视频文件（扩展名或路径中含 .m3u8/.mp4）。
+    static func isDirectMedia(_ urlString: String) -> Bool {
+        let lowercased = urlString.lowercased()
+        if lowercased.contains(".m3u8") || lowercased.contains(".mp4") { return true }
+        guard let url = URL(string: urlString) else { return false }
+        return mediaExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    /// 是否需要先嗅探：http(s) 地址且看起来不是视频文件。
+    static func needsResolve(_ urlString: String) -> Bool {
+        let lowercased = urlString.lowercased()
+        guard lowercased.hasPrefix("http://") || lowercased.hasPrefix("https://") else { return false }
+        return !isDirectMedia(urlString)
+    }
+
+    /// 打开网页并提取视频地址；不是网页或没找到时返回 nil（调用方按原地址播放）。
+    static func resolve(pageURL: String) async -> String? {
+        guard let url = URL(string: pageURL) else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 15)
+        request.setValue(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            forHTTPHeaderField: "User-Agent"
+        )
+        do {
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            // 只读网页：没有扩展名的地址也可能直接就是视频流，不能整个下载下来
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+                  (http.mimeType ?? "").lowercased().contains("html") else {
+                bytes.task.cancel()
+                return nil
+            }
+            var data = Data()
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count >= maxPageBytes { break }
+            }
+            bytes.task.cancel()
+            let html = String(decoding: data, as: UTF8.self)
+            return extractMediaURL(from: html, pageURL: http.url ?? url)
+        } catch {
+            return nil
+        }
+    }
+
+    /// 从网页文本中找出视频地址（优先 m3u8），相对路径按网页地址补全。
+    static func extractMediaURL(from html: String, pageURL: URL) -> String? {
+        // 兼容 JSON 转义的斜杠，如 https:\/\/host\/a.m3u8
+        let text = html.replacingOccurrences(of: "\\/", with: "/")
+        for ext in ["m3u8", "mp4"] {
+            let pattern = #"["'(]((?:https?:)?/[^"'()\s<>]*?\."# + ext + #"(?:\?[^"'()\s<>]*)?)["')]"#
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            for match in regex.matches(in: text, range: range) {
+                guard let captured = Range(match.range(at: 1), in: text) else { continue }
+                let candidate = String(text[captured])
+                if let resolved = URL(string: candidate, relativeTo: pageURL)?.absoluteURL,
+                   resolved.scheme?.hasPrefix("http") == true {
+                    return resolved.absoluteString
+                }
+            }
+        }
+        return nil
     }
 }

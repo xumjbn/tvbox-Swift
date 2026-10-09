@@ -46,12 +46,12 @@ struct DetailView: View {
                             openFullScreenPlayer()
                         }
                 } else if !showFullScreen, viewModel.isPlaying, viewModel.playUrl == nil, viewModel.isPreparingPlayback {
-                    // 首次播放时正在去广告：先占住播放器位置，避免布局跳动
+                    // 首次播放时正在解析地址或去广告：先占住播放器位置，避免布局跳动
                     ZStack {
                         Color.black
                         VStack(spacing: 10) {
                             ProgressView().tint(.orange)
-                            Text("正在过滤广告…")
+                            Text("正在准备播放…")
                                 .font(.caption)
                                 .foregroundColor(.white.opacity(0.6))
                         }
