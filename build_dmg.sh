@@ -62,13 +62,16 @@ step() { echo; echo "==> $*"; }
 ensure_entitlements() {
     # 该文件被 .gitignore 忽略，新 clone 下不存在会导致签名阶段失败，这里补一份最小配置。
     [ -f "$ENTITLEMENTS" ] && return
-    step "未找到 $ENTITLEMENTS，生成默认 entitlements（仅网络访问）"
+    step "未找到 $ENTITLEMENTS，生成默认 entitlements（网络访问 + 本地服务）"
     cat > "$ENTITLEMENTS" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>com.apple.security.network.client</key>
+    <true/>
+    <!-- 去广告的本地播放列表服务监听 127.0.0.1 -->
+    <key>com.apple.security.network.server</key>
     <true/>
 </dict>
 </plist>

@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Network
 
 struct PlaybackQualityOption: Identifiable, Hashable {
     /// “自动”选项固定标识。
@@ -35,8 +36,12 @@ class DetailViewModel: ObservableObject {
     @Published var selectedEpisodeIndex: Int = 0
     /// 是否处于播放态。
     @Published var isPlaying = false
-    /// 当前实际播放地址（可能是原始地址，也可能是清晰度切换后的子流地址）。
+    /// 当前实际播放地址（可能是原始地址、清晰度子流地址，或去广告后的本地地址）。
     @Published var playUrl: String?
+    /// 去广告结果提示（如"已过滤 2 段广告（约 30 秒）"），未过滤时为 nil。
+    @Published var adFilterNote: String?
+    /// 正在准备播放地址（去广告处理中），期间旧播放器的进度回调需忽略。
+    @Published private(set) var isPreparingPlayback = false
     /// 续播起始位置（秒）。
     @Published var resumeSeconds: Double = 0
     /// 当前可选清晰度列表。
@@ -57,7 +62,11 @@ class DetailViewModel: ObservableObject {
     private var qualityResolveTask: Task<Void, Never>?
     /// 解析令牌，防止异步结果回写到过期状态。
     private var qualityResolveToken = UUID()
-    
+    /// 请求播放的原始地址（去广告后 playUrl 会变成本地地址，比较时以此为准）。
+    private var requestedPlayURL: String?
+    /// 播放地址准备令牌，防止快速切集时旧结果覆盖新地址。
+    private var playbackPrepareToken = UUID()
+
     /// 加载视频详情
     func loadDetail(video: Movie.Video) async {
         guard let source = ApiConfig.shared.getSource(key: video.sourceKey)
@@ -112,7 +121,7 @@ class DetailViewModel: ObservableObject {
         
         // 播放中切线路时，立即切换到新线路对应剧集
         if isPlaying {
-            playUrl = selectedPlayableURL(fallback: episodeURL)
+            setPlaybackURL(selectedPlayableURL(fallback: episodeURL))
         }
     }
     
@@ -128,7 +137,7 @@ class DetailViewModel: ObservableObject {
             // 仅当剧集 URL 变化时重置清晰度选择。
             let shouldResetQuality = qualityBaseEpisodeURL != episode.url
             updateQualityOptions(for: episode.url, resetSelection: shouldResetQuality)
-            playUrl = selectedPlayableURL(fallback: episode.url)
+            setPlaybackURL(selectedPlayableURL(fallback: episode.url))
             isPlaying = true
         }
     }
@@ -155,7 +164,7 @@ class DetailViewModel: ObservableObject {
         realtimeProgressSeconds = progress
         let episodeURL = episodes[targetIndex].url
         updateQualityOptions(for: episodeURL, resetSelection: true)
-        playUrl = selectedPlayableURL(fallback: episodeURL)
+        setPlaybackURL(selectedPlayableURL(fallback: episodeURL))
         isPlaying = true
     }
     
@@ -167,17 +176,18 @@ class DetailViewModel: ObservableObject {
         
         // “自动”使用基础剧集地址；其他选项使用对应变体地址。
         let targetURL = option.url.isEmpty ? qualityBaseEpisodeURL : option.url
-        guard !targetURL.isEmpty, playUrl != targetURL else { return }
-        
+        guard !targetURL.isEmpty, requestedPlayURL != targetURL else { return }
+
         let progress = max(currentPlaybackSeconds(), 0)
         resumeSeconds = progress
         realtimeProgressSeconds = progress
-        playUrl = targetURL
+        setPlaybackURL(targetURL)
     }
     
     /// 播放器时间回调
     func updatePlaybackProgress(seconds: Double) {
-        guard seconds.isFinite else { return }
+        // 准备新地址期间旧播放器仍在走，它的进度不属于新剧集
+        guard seconds.isFinite, !isPreparingPlayback else { return }
         realtimeProgressSeconds = max(seconds, 0)
     }
     
@@ -229,6 +239,34 @@ class DetailViewModel: ObservableObject {
         qualityOptions.count > 1
     }
     
+    /// 设置播放地址：开启广告过滤且为 HLS 时先去广告，失败或未发现广告则用原地址。
+    /// 处理期间保持旧地址不变，避免全屏播放器因 playUrl 置空而被关闭。
+    private func setPlaybackURL(_ url: String) {
+        requestedPlayURL = url
+        adFilterNote = nil
+        let token = UUID()
+        playbackPrepareToken = token
+
+        guard HLSAdFilter.isEnabled, let parsed = URL(string: url), Self.looksLikeHLSURL(parsed) else {
+            isPreparingPlayback = false
+            playUrl = url
+            return
+        }
+
+        isPreparingPlayback = true
+        Task {
+            let prepared = await HLSAdFilter.prepare(url: url)
+            guard token == playbackPrepareToken else { return }
+            isPreparingPlayback = false
+            if let prepared {
+                playUrl = prepared.localURL
+                adFilterNote = "已过滤 \(prepared.removedGroups) 段广告（约 \(Int(prepared.removedSeconds.rounded())) 秒）"
+            } else {
+                playUrl = url
+            }
+        }
+    }
+
     private func selectedPlayableURL(fallback: String) -> String {
         // 若当前清晰度存在有效 URL，则优先使用；否则回退剧集原始地址。
         let selected = qualityOptions.first(where: { $0.id == selectedQualityId })?.url
@@ -488,5 +526,342 @@ class DetailViewModel: ObservableObject {
             parts.append(tail)
         }
         return parts
+    }
+}
+
+// MARK: - HLS 广告过滤
+
+/// m3u8 去广告（对应影视仓的"去广告"）。
+///
+/// 资源站常在正片切片之间插入广告，并用 `#EXT-X-DISCONTINUITY` 隔开。
+/// 识别规则：按 DISCONTINUITY 切段，正片切片来自同一目录；
+/// 目录与正片不同、且总时长较短的段判定为广告并删除。识别结果可疑时宁可不删。
+enum HLSAdFilter {
+    /// 设置开关的持久化 key，默认开启。
+    static let enabledKey = "ad_filter_enabled"
+
+    static var isEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
+
+    /// 单段广告的最长时长（秒），超过视为正片的一部分。
+    private static let maxAdGroupSeconds: Double = 120
+    /// 删除总时长占比上限，超过说明识别不可靠，放弃过滤。
+    private static let maxRemovedRatio: Double = 0.3
+
+    struct Result {
+        let playlist: String
+        let removedGroups: Int
+        let removedSeconds: Double
+    }
+
+    struct Prepared {
+        let localURL: String
+        let removedGroups: Int
+        let removedSeconds: Double
+    }
+
+    /// 下载并过滤播放地址；未识别到广告、非 HLS 或任何一步失败都返回 nil（调用方按原地址播放）。
+    static func prepare(url: String) async -> Prepared? {
+        let network = NetworkManager.shared
+        guard var (text, mediaURL) = try? await network.getStringWithFinalURL(from: url, maxRetries: 0),
+              text.hasPrefix("#EXTM3U") || text.contains("#EXTINF") else { return nil }
+
+        // 主播放列表：选码率最高的子列表再过滤（去广告需要逐切片分析）
+        if text.contains("#EXT-X-STREAM-INF") {
+            guard let variant = bestVariant(in: text, masterURL: mediaURL),
+                  let fetched = try? await network.getStringWithFinalURL(from: variant.absoluteString, maxRetries: 0),
+                  !fetched.text.contains("#EXT-X-STREAM-INF") else { return nil }
+            (text, mediaURL) = fetched
+        }
+
+        guard let result = filter(text, playlistURL: mediaURL),
+              let localURL = try? await LocalPlaylistServer.shared.publish(result.playlist) else { return nil }
+        return Prepared(localURL: localURL.absoluteString, removedGroups: result.removedGroups, removedSeconds: result.removedSeconds)
+    }
+
+    // MARK: 解析
+
+    private struct Segment {
+        var tags: [String] = []
+        var extinf = ""
+        var duration: Double = 0
+        var uri = ""
+        var keyLine: String?
+        var mapLine: String?
+
+        /// 切片所在目录（host + 父路径），正片切片通常共享同一目录。
+        var directory: String {
+            guard let url = URL(string: uri) else { return uri }
+            return (url.host ?? "") + url.deletingLastPathComponent().path
+        }
+    }
+
+    /// 过滤媒体播放列表；未发现广告返回 nil。
+    static func filter(_ content: String, playlistURL: URL) -> Result? {
+        var header: [String] = []
+        var groups: [[Segment]] = [[]]
+        var pending = Segment()
+        var currentKey: String?
+        var currentMap: String?
+        var hasEndList = false
+        var seenFirstSegmentTag = false
+
+        for rawLine in content.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+
+            if line.hasPrefix("#EXT-X-DISCONTINUITY") && !line.hasPrefix("#EXT-X-DISCONTINUITY-SEQUENCE") {
+                if !(groups.last?.isEmpty ?? true) { groups.append([]) }
+                seenFirstSegmentTag = true
+            } else if line.hasPrefix("#EXT-X-KEY") {
+                currentKey = absolutizeURIAttribute(line, base: playlistURL)
+                if currentKey?.contains("METHOD=NONE") == true { currentKey = nil }
+                seenFirstSegmentTag = true
+            } else if line.hasPrefix("#EXT-X-MAP") {
+                currentMap = absolutizeURIAttribute(line, base: playlistURL)
+                seenFirstSegmentTag = true
+            } else if line.hasPrefix("#EXTINF") {
+                pending.extinf = line
+                let value = line.dropFirst("#EXTINF:".count).split(separator: ",").first ?? ""
+                pending.duration = Double(value.trimmingCharacters(in: .whitespaces)) ?? 0
+                seenFirstSegmentTag = true
+            } else if line.hasPrefix("#EXT-X-ENDLIST") {
+                hasEndList = true
+            } else if line.hasPrefix("#") {
+                if seenFirstSegmentTag || isSegmentTag(line) {
+                    pending.tags.append(line)
+                    seenFirstSegmentTag = true
+                } else {
+                    header.append(line)
+                }
+            } else {
+                // 切片 URI
+                pending.uri = URL(string: line, relativeTo: playlistURL)?.absoluteString ?? line
+                pending.keyLine = currentKey
+                pending.mapLine = currentMap
+                groups[groups.count - 1].append(pending)
+                pending = Segment()
+            }
+        }
+
+        groups.removeAll { $0.isEmpty }
+        guard groups.count >= 2 else { return nil }
+
+        // 正片目录：累计时长最长的目录
+        var durationByDirectory: [String: Double] = [:]
+        for segment in groups.joined() {
+            durationByDirectory[segment.directory, default: 0] += segment.duration
+        }
+        guard let mainDirectory = durationByDirectory.max(by: { $0.value < $1.value })?.key else { return nil }
+
+        let totalSeconds = groups.joined().reduce(0) { $0 + $1.duration }
+        var kept: [[Segment]] = []
+        var removedGroups = 0
+        var removedSeconds: Double = 0
+
+        for group in groups {
+            let groupSeconds = group.reduce(0) { $0 + $1.duration }
+            let mainCount = group.filter { $0.directory == mainDirectory }.count
+            // 整段都不在正片目录、且时长短 → 广告
+            if mainCount == 0 && groupSeconds <= maxAdGroupSeconds {
+                removedGroups += 1
+                removedSeconds += groupSeconds
+            } else {
+                kept.append(group)
+            }
+        }
+
+        guard removedGroups > 0, !kept.isEmpty,
+              totalSeconds <= 0 || removedSeconds / totalSeconds <= maxRemovedRatio else { return nil }
+
+        // 重建播放列表：保留段之间仍用 DISCONTINUITY 分隔（时间戳可能不连续），并补齐加密/初始化信息
+        var output = header.isEmpty ? ["#EXTM3U"] : header
+        if !output.contains(where: { $0.hasPrefix("#EXTM3U") }) { output.insert("#EXTM3U", at: 0) }
+        var emittedKey: String?
+        var emittedMap: String?
+        for (index, group) in kept.enumerated() {
+            if index > 0 { output.append("#EXT-X-DISCONTINUITY") }
+            for segment in group {
+                if segment.keyLine != emittedKey {
+                    output.append(segment.keyLine ?? "#EXT-X-KEY:METHOD=NONE")
+                    emittedKey = segment.keyLine
+                }
+                if let map = segment.mapLine, map != emittedMap {
+                    output.append(map)
+                    emittedMap = map
+                }
+                output.append(contentsOf: segment.tags)
+                output.append(segment.extinf.isEmpty ? "#EXTINF:\(segment.duration)," : segment.extinf)
+                output.append(segment.uri)
+            }
+        }
+        if hasEndList { output.append("#EXT-X-ENDLIST") }
+
+        return Result(playlist: output.joined(separator: "\n") + "\n", removedGroups: removedGroups, removedSeconds: removedSeconds)
+    }
+
+    /// 属于单个切片的标签（出现在头部之后）。
+    private static func isSegmentTag(_ line: String) -> Bool {
+        line.hasPrefix("#EXT-X-BYTERANGE") || line.hasPrefix("#EXT-X-PROGRAM-DATE-TIME") || line.hasPrefix("#EXT-X-GAP")
+    }
+
+    /// 把标签里的 URI="相对路径" 改成绝对地址（列表改由本地服务提供后，相对路径会解析错）。
+    private static func absolutizeURIAttribute(_ line: String, base: URL) -> String {
+        guard let range = line.range(of: #"URI="([^"]*)""#, options: .regularExpression) else { return line }
+        let raw = String(line[range]).dropFirst("URI=\"".count).dropLast()
+        let absolute = URL(string: String(raw), relativeTo: base)?.absoluteString ?? String(raw)
+        return line.replacingCharacters(in: range, with: "URI=\"\(absolute)\"")
+    }
+
+    /// 主播放列表中码率最高的子列表地址。
+    private static func bestVariant(in master: String, masterURL: URL) -> URL? {
+        var best: (bandwidth: Int, url: URL)?
+        var pendingBandwidth: Int?
+        for rawLine in master.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#EXT-X-STREAM-INF") {
+                let match = line.range(of: #"BANDWIDTH=(\d+)"#, options: .regularExpression)
+                pendingBandwidth = match.flatMap { Int(line[$0].dropFirst("BANDWIDTH=".count)) } ?? 0
+            } else if let bandwidth = pendingBandwidth, !line.isEmpty, !line.hasPrefix("#") {
+                if let url = URL(string: line, relativeTo: masterURL)?.absoluteURL,
+                   best == nil || bandwidth > best!.bandwidth {
+                    best = (bandwidth, url)
+                }
+                pendingBandwidth = nil
+            }
+        }
+        return best?.url
+    }
+}
+
+// MARK: - 本地播放列表服务
+
+/// 只监听 127.0.0.1 的极简 HTTP 服务，向播放器提供去广告后的 m3u8。
+/// 系统播放器不支持本地文件形式的 HLS 列表，因此统一走 http；切片仍直连原 CDN。
+final class LocalPlaylistServer: @unchecked Sendable {
+    static let shared = LocalPlaylistServer()
+
+    /// 最多保留的播放列表数量（按发布顺序淘汰）。
+    private static let capacity = 30
+
+    private let queue = DispatchQueue(label: "tvbox.local-playlist-server")
+    private var listener: NWListener?
+    private var port: NWEndpoint.Port?
+    private var waiters: [CheckedContinuation<NWEndpoint.Port, Error>] = []
+    private var playlists: [String: Data] = [:]
+    private var order: [String] = []
+
+    private init() {}
+
+    /// 发布一份播放列表，返回可供播放器访问的本地地址。
+    func publish(_ playlist: String) async throws -> URL {
+        let port = try await ensureStarted()
+        let id = UUID().uuidString
+        queue.sync {
+            playlists[id] = Data(playlist.utf8)
+            order.append(id)
+            while order.count > Self.capacity {
+                playlists.removeValue(forKey: order.removeFirst())
+            }
+        }
+        guard let url = URL(string: "http://127.0.0.1:\(port.rawValue)/\(id).m3u8") else {
+            throw URLError(.badURL)
+        }
+        return url
+    }
+
+    private func ensureStarted() async throws -> NWEndpoint.Port {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                if let port = self.port {
+                    continuation.resume(returning: port)
+                    return
+                }
+                self.waiters.append(continuation)
+                if self.listener == nil {
+                    self.startListener()
+                }
+            }
+        }
+    }
+
+    /// 在 queue 上调用。
+    private func startListener() {
+        do {
+            let parameters = NWParameters.tcp
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+            let listener = try NWListener(using: parameters)
+            listener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.port = listener.port
+                    if let port = listener.port {
+                        self.resumeWaiters(.success(port))
+                    }
+                case .failed(let error):
+                    // 例如 iOS 进入后台后套接字失效：重置，下次发布时重新启动
+                    self.reset()
+                    self.resumeWaiters(.failure(error))
+                case .cancelled:
+                    self.reset()
+                default:
+                    break
+                }
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                self?.handle(connection)
+            }
+            self.listener = listener
+            listener.start(queue: queue)
+        } catch {
+            reset()
+            resumeWaiters(.failure(error))
+        }
+    }
+
+    private func reset() {
+        listener?.cancel()
+        listener = nil
+        port = nil
+    }
+
+    private func resumeWaiters(_ result: Result<NWEndpoint.Port, Error>) {
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume(with: result) }
+    }
+
+    private func handle(_ connection: NWConnection) {
+        connection.start(queue: queue)
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1024) { [weak self] data, _, _, _ in
+            guard let self else { connection.cancel(); return }
+            let request = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            // 请求行形如 "GET /<id>.m3u8 HTTP/1.1"
+            let parts = request.split(separator: "\r\n").first?.split(separator: " ") ?? []
+            let method = parts.first.map(String.init) ?? ""
+            let path = parts.count > 1 ? String(parts[1]) : ""
+            let id = path.split(separator: "?").first.map { String($0.dropFirst()) }?
+                .replacingOccurrences(of: ".m3u8", with: "") ?? ""
+
+            var response: Data
+            if let body = self.playlists[id] {
+                let head = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: application/vnd.apple.mpegurl\r\n"
+                    + "Content-Length: \(body.count)\r\n"
+                    + "Cache-Control: no-cache\r\n"
+                    + "Access-Control-Allow-Origin: *\r\n"
+                    + "Connection: close\r\n\r\n"
+                response = Data(head.utf8)
+                if method != "HEAD" { response.append(body) }
+            } else {
+                response = Data("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+            }
+            connection.send(content: response, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
     }
 }

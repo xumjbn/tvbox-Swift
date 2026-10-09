@@ -4,6 +4,7 @@ import SwiftUI
 struct HomeView: View {
     @StateObject private var viewModel = HomeViewModel()
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var subscriptionStore = VodSubscriptionStore.shared
     @State private var categoryScrollAnchorId: String?
     /// 筛选栏是否展开（跨启动记忆）。
     @AppStorage("home_filter_expanded") private var isFilterExpanded = true
@@ -46,6 +47,22 @@ struct HomeView: View {
                 viewModel.selectSort(first)
             }
         }
+        // 切换点播订阅（首页菜单或设置页）后重新加载分类与内容
+        .onChange(of: subscriptionStore.active?.id) { _, _ in
+            Task { await viewModel.refresh() }
+        }
+        .overlay(alignment: .bottom) {
+            if let error = subscriptionStore.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(Capsule().fill(Color.red.opacity(0.85)))
+                    .padding(.bottom, 16)
+                    .onTapGesture { subscriptionStore.lastError = nil }
+            }
+        }
     }
     
     // MARK: - 顶部栏（源选择器）
@@ -54,15 +71,35 @@ struct HomeView: View {
         HStack(spacing: 12) {
             // 源切换按钮
             Menu {
-                ForEach(ApiConfig.shared.sourceBeanList.filter { $0.isSupportedInSwift }) { source in
-                    Button {
-                        ApiConfig.shared.setHomeSource(source)
-                        Task { await viewModel.refresh() }
-                    } label: {
-                        HStack {
-                            Text(source.name)
-                            if source.key == ApiConfig.shared.homeSourceBean?.key {
-                                Image(systemName: "checkmark")
+                // 多个点播订阅时可在这里直接切换（对应影视仓多仓）
+                if subscriptionStore.subscriptions.count > 1 {
+                    Section("点播订阅") {
+                        ForEach(subscriptionStore.subscriptions) { subscription in
+                            Button {
+                                // 首页刷新由下方 onChange(of: 当前订阅) 统一触发
+                                Task { await subscriptionStore.activate(subscription, appState: appState) }
+                            } label: {
+                                HStack {
+                                    Text(subscription.name)
+                                    if subscriptionStore.isActive(subscription) {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Section("站点") {
+                    ForEach(ApiConfig.shared.sourceBeanList.filter { $0.isSupportedInSwift }) { source in
+                        Button {
+                            ApiConfig.shared.setHomeSource(source)
+                            Task { await viewModel.refresh() }
+                        } label: {
+                            HStack {
+                                Text(source.name)
+                                if source.key == ApiConfig.shared.homeSourceBean?.key {
+                                    Image(systemName: "checkmark")
+                                }
                             }
                         }
                     }
